@@ -1,12 +1,14 @@
 import os
 import io
 import re
+import uuid
 import wave
 import math
 import json
 import time
 import struct
 import threading
+import webbrowser
 import winsound
 from datetime import datetime
 import requests
@@ -16,6 +18,7 @@ import pyaudiowpatch as pyaudio
 from PIL import Image
 from groq import Groq
 from dotenv import load_dotenv
+import sys
 
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -24,6 +27,10 @@ WS_BASE = "ws://127.0.0.1:8000/ws/stream"
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 ctk.set_appearance_mode("light")
+
+def resource_path(relative_path: str) -> str:
+    base_path = getattr(sys, "_MEIPASS", os.path.abspath("."))
+    return os.path.join(base_path, relative_path)
 
 
 class EchoNoteDesktopApp(ctk.CTk):
@@ -81,6 +88,7 @@ class EchoNoteDesktopApp(ctk.CTk):
         # Load app_logo.jpg from project root
         self.logo_img = None
         for fname in ("app_logo.jpg", "logo.png", "logo.jpg"):
+            full_path = resource_path(fname)
             if os.path.exists(fname):
                 self.logo_img = ctk.CTkImage(
                     light_image=Image.open(fname),
@@ -175,7 +183,14 @@ class EchoNoteDesktopApp(ctk.CTk):
             fg_color=self.c_accent, hover_color=self.c_accent_hover,
             font=self.f_h3, text_color="#FFFFFF", command=self._submit_auth
         )
-        self.auth_btn.pack(padx=32, pady=(0, 12))
+        self.auth_btn.pack(padx=32, pady=(0, 10))
+
+        ctk.CTkButton(
+            card, text="G   Continue with Google", width=356, height=40, corner_radius=10,
+            fg_color=self.c_bg, hover_color=self.c_subtle,
+            border_width=1, border_color=self.c_border, text_color=self.c_text,
+            font=self.f_h3, command=self._start_google_login
+        ).pack(padx=32, pady=(0, 12))
 
         self.auth_toggle_btn = ctk.CTkButton(
             card, text="Don't have an account? Create one",
@@ -214,6 +229,25 @@ class EchoNoteDesktopApp(ctk.CTk):
                 self.auth_err.configure(text=res.json().get("detail", "Authentication failed."))
         except Exception:
             self.auth_err.configure(text="Backend offline. Start uvicorn on port 8000.")
+
+    def _start_google_login(self):
+        state = str(uuid.uuid4())
+        webbrowser.open(f"{API_BASE}/auth/google/login?state={state}&local=true")
+        self.auth_err.configure(text="Complete sign-in in your browser...", text_color=self.c_muted)
+
+        def poll():
+            for _ in range(60):
+                try:
+                    res = requests.get(f"{API_BASE}/auth/google/poll/{state}", timeout=4).json()
+                    if res.get("authenticated"):
+                        self.user = res["user"]
+                        self.after(0, self.build_shell)
+                        return
+                except Exception:
+                    pass
+                time.sleep(2)
+
+        threading.Thread(target=poll, daemon=True).start()
 
     # ==========================================================
     # 2. MAIN EDITORIAL SHELL
@@ -454,6 +488,13 @@ class EchoNoteDesktopApp(ctk.CTk):
             fg_color=self.c_pill_bg, hover_color=self.c_border,
             text_color=self.c_pill_text, font=self.f_tiny, command=self.save_notes_to_db
         ).pack(side="right")
+
+        ctk.CTkButton(
+            nf_head, text="Clear", width=64, height=26, corner_radius=8,
+            fg_color="transparent", hover_color=self.c_subtle,
+            border_width=1, border_color=self.c_border,
+            text_color=self.c_muted, font=self.f_tiny, command=self.clear_session_notes
+        ).pack(side="right", padx=(0, 8))
 
         self.auto_notes_lbl = ctk.CTkLabel(
             notes_footer,
@@ -916,6 +957,43 @@ class EchoNoteDesktopApp(ctk.CTk):
         if txt and self.backend_ws:
             self.backend_ws.send(txt)
             self.sim_entry.delete(0, "end")
+            
+    def clear_session_notes(self):
+        self.session_notes.clear()
+        self.transcript_entries.clear()
+        self.generated_title = ""
+
+        # Reset session title & timer if not actively recording
+        self.session_title_entry.delete(0, "end")
+        self.session_title_entry.insert(0, "Current Lecture Session")
+        if not self.is_listening:
+            self.session_seconds = 0
+            self.timer_lbl.configure(text="00:00:00")
+
+        # Reset Auto Notes footer text
+        self.auto_notes_lbl.configure(
+            text="English study notes appear here automatically every 4 sentences."
+        )
+
+        # Clear Dashboard transcript stream & restore empty prompt
+        for w in self.transcript_scroll.winfo_children():
+            w.destroy()
+        self.transcript_empty_lbl = ctk.CTkLabel(
+            self.transcript_scroll,
+            text="Click 'Start Listening' to capture system lecture audio, or simulate a phrase below.",
+            font=self.f_small, text_color=self.c_muted
+        )
+        self.transcript_empty_lbl.pack(anchor="w", padx=6, pady=12)
+
+        # Clear Live Session focus box
+        if hasattr(self, "focus_box") and self.focus_box.winfo_exists():
+            self.focus_box.delete("1.0", "end")
+
+        # Reset backend rolling buffer so old sentences don't bleed into new notes
+        threading.Thread(
+            target=lambda: requests.post(f"{API_BASE}/api/notes/reset-buffer", timeout=2),
+            daemon=True
+        ).start()
 
     def save_notes_to_db(self):
         if not self.session_notes:

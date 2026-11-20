@@ -9,10 +9,23 @@ import {
   SafeAreaView,
   StatusBar,
   Vibration,
-  Alert,
   Switch,
+  Linking,
   Platform,
+  AppState,
+  Animated,
 } from 'react-native';
+import * as Notifications from 'expo-notifications';
+
+// Configure foreground & background notification behavior
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldPlaySound: true,
+    shouldSetBadge: true,
+  }),
+});
 
 export default function App() {
   const [serverUrl, setServerUrl] = useState('https://cheddar-banjo-agile.ngrok-free.dev');
@@ -27,26 +40,30 @@ export default function App() {
   const [password, setPassword] = useState('');
   const [authError, setAuthError] = useState('');
 
-  // Navigation & Live Stream State
+  // Navigation & Synced Desktop Stream State
   const [activeTab, setActiveTab] = useState('dashboard');
   const [connected, setConnected] = useState(false);
-  const [simPhrase, setSimPhrase] = useState('Areesha attendance lag rahi hai');
-  const [transcripts, setTranscripts] = useState([]);
   const [alerts, setAlerts] = useState([]);
-
-  // Session Notes & Auto-Title State
   const [liveNotes, setLiveNotes] = useState([]);
-  const [generatedTitle, setGeneratedTitle] = useState('');
-  const [savedBanner, setSavedBanner] = useState(false);
 
-  // Triggers & Saved Notes State
+  // Synced User Data (Keywords & Saved Notes)
   const [triggers, setTriggers] = useState([]);
   const [newTrigger, setNewTrigger] = useState('');
   const [savedNotes, setSavedNotes] = useState([]);
 
+  // In-App Top Toast Banner State
+  const [topBanner, setTopBanner] = useState(null);
+  const bannerAnim = useRef(new Animated.Value(-140)).current;
+  const bannerTimerRef = useRef(null);
+
   const wsRef = useRef(null);
+  const pingIntervalRef = useRef(null);
+  const reconnectTimeoutRef = useRef(null);
+  const appStateRef = useRef(AppState.currentState);
   const awayModeRef = useRef(awayMode);
   awayModeRef.current = awayMode;
+  const userRef = useRef(user);
+  userRef.current = user;
 
   // Editorial Palette matching EchoNote Desktop
   const theme = darkMode
@@ -89,6 +106,55 @@ export default function App() {
     'ngrok-skip-browser-warning': 'true',
   };
 
+  // --- REQUEST NOTIFICATION PERMISSIONS ON STARTUP ---
+  useEffect(() => {
+    (async () => {
+      try {
+        const { status: existingStatus } = await Notifications.getPermissionsAsync();
+        if (existingStatus !== 'granted') {
+          await Notifications.requestPermissionsAsync();
+        }
+      } catch (e) {}
+    })();
+  }, []);
+
+  // --- TOP SLIDE-DOWN IN-APP BANNER ---
+  const showInAppBanner = (title, body) => {
+    if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
+    setTopBanner({ title, body });
+    Animated.spring(bannerAnim, {
+      toValue: Platform.OS === 'android' ? 34 : 12,
+      useNativeDriver: true,
+      bounciness: 6,
+    }).start();
+
+    bannerTimerRef.current = setTimeout(() => {
+      hideInAppBanner();
+    }, 6000);
+  };
+
+  const hideInAppBanner = () => {
+    Animated.timing(bannerAnim, {
+      toValue: -160,
+      duration: 240,
+      useNativeDriver: true,
+    }).start(() => setTopBanner(null));
+  };
+
+  // --- FIRE SYSTEM NOTIFICATION WHEN USER IS IN WHATSAPP / BACKGROUND ---
+  const triggerSystemNotification = async (title, body) => {
+    try {
+      await Notifications.scheduleNotificationAsync({
+        content: {
+          title,
+          body,
+          sound: true,
+        },
+        trigger: null,
+      });
+    } catch (e) {}
+  };
+
   // --- AUTHENTICATION ---
   const handleAuth = async () => {
     setAuthError('');
@@ -113,7 +179,29 @@ export default function App() {
     }
   };
 
-  // --- DATA FETCHERS ---
+  const startGoogleLogin = async () => {
+    setAuthError('');
+    const rawState = Date.now().toString() + Math.random().toString(36).slice(2);
+    const loginUrl = `${cleanHttpUrl()}/auth/google/login?state=${encodeURIComponent(rawState)}`;
+    await Linking.openURL(loginUrl);
+
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`${cleanHttpUrl()}/auth/google/poll/${rawState}`, {
+          headers: apiHeaders,
+        });
+        const data = await res.json();
+        if (data.authenticated && data.user) {
+          clearInterval(interval);
+          setUser(data.user);
+        }
+      } catch (e) {}
+    }, 2000);
+
+    setTimeout(() => clearInterval(interval), 120000);
+  };
+
+  // --- SYNCED USER DATA FETCHERS ---
   const fetchTriggers = async (uid) => {
     try {
       const res = await fetch(`${cleanHttpUrl()}/api/triggers/${uid}`, { headers: apiHeaders });
@@ -167,94 +255,51 @@ export default function App() {
     } catch (e) {}
   };
 
-  // --- SESSION RESET, AI TITLE & SAVE ---
-  const startNewNoteSession = async () => {
-    setTranscripts([]);
-    setLiveNotes([]);
-    setGeneratedTitle('');
-    setSavedBanner(false);
-    try {
-      await fetch(`${cleanHttpUrl()}/api/notes/reset-buffer`, {
-        method: 'POST',
-        headers: apiHeaders,
-      });
-    } catch (e) {}
-  };
-
-  const generateSessionTitle = async () => {
-    if (!liveNotes.length) return '';
-    const content = liveNotes.map((n) => `• ${n}`).join('\n');
-    try {
-      const res = await fetch(`${cleanHttpUrl()}/api/notes/generate-title`, {
-        method: 'POST',
-        headers: apiHeaders,
-        body: JSON.stringify({ content }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const title = data.title || 'Lecture Summary';
-        setGeneratedTitle(title);
-        return title;
-      }
-    } catch (e) {}
-    return '';
-  };
-
-  const saveCurrentSession = async () => {
-    if (!liveNotes.length || !user) return;
-    let titleToSave = generatedTitle;
-    if (!titleToSave) {
-      titleToSave = await generateSessionTitle();
+  // --- PERSISTENT WEBSOCKET WITH HEARTBEAT & AUTO-RECONNECT ---
+  const cleanupWs = () => {
+    if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
+    if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+    if (wsRef.current) {
+      wsRef.current.onclose = null;
+      wsRef.current.close();
+      wsRef.current = null;
     }
-    try {
-      const content = liveNotes.map((n) => `• ${n}`).join('\n');
-      const res = await fetch(`${cleanHttpUrl()}/api/notes/save`, {
-        method: 'POST',
-        headers: apiHeaders,
-        body: JSON.stringify({
-          user_id: user.user_id,
-          title: titleToSave,
-          content,
-        }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.title && !titleToSave) setGeneratedTitle(data.title);
-        setSavedBanner(true);
-        fetchSavedNotes(user.user_id);
-      }
-    } catch (e) {}
   };
 
-  // --- WEBSOCKET ---
   const connectWs = (uid) => {
-    if (wsRef.current) wsRef.current.close();
+    cleanupWs();
     const ws = new WebSocket(getWsUrl(uid), null, {
       headers: { 'ngrok-skip-browser-warning': 'true' },
     });
     wsRef.current = ws;
 
-    ws.onopen = () => setConnected(true);
+    ws.onopen = () => {
+      setConnected(true);
+      pingIntervalRef.current = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send('');
+        }
+      }, 15000);
+    };
+
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        if (data.type === 'TRANSCRIPT' && data.text) {
-          setTranscripts((prev) => [
-            ...prev.slice(-24),
-            {
-              id: Date.now().toString() + Math.random(),
-              time: data.timestamp || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-              text: data.text,
-            },
-          ]);
-        } else if (data.type === 'MEETING_NOTE' && data.notes) {
-          setSavedBanner(false);
+        if (data.type === 'MEETING_NOTE' && data.notes) {
           setLiveNotes((prev) => [...prev, ...data.notes]);
         } else if (data.trigger_detected) {
+          const alertTitle = `EchoNote • ${(data.event_type || 'ALERT').replace('_', ' ')}`;
+          const alertBody = data.summary || data.original_text;
+
           if (awayModeRef.current) {
-            Vibration.vibrate([0, 500, 200, 500]);
-            Alert.alert(data.event_type || 'EchoNote Alert', data.summary || data.original_text);
+            Vibration.vibrate([0, 600, 250, 600, 250, 800]);
+            if (AppState.currentState !== 'active') {
+              triggerSystemNotification(alertTitle, alertBody);
+            } else {
+              showInAppBanner(alertTitle, alertBody);
+            }
           }
+
           setAlerts((prev) => [
             {
               id: Date.now().toString() + Math.random(),
@@ -266,30 +311,49 @@ export default function App() {
         }
       } catch (e) {}
     };
-    ws.onclose = () => setConnected(false);
-    ws.onerror = () => setConnected(false);
+
+    ws.onclose = () => {
+      setConnected(false);
+      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
+      if (userRef.current) {
+        reconnectTimeoutRef.current = setTimeout(() => {
+          if (userRef.current) connectWs(userRef.current.user_id);
+        }, 2500);
+      }
+    };
+
+    ws.onerror = () => {
+      setConnected(false);
+    };
   };
+
+  // Monitor AppState transitions (WhatsApp <-> EchoNote) to ensure immediate reconnection
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (nextState) => {
+      appStateRef.current = nextState;
+      if (
+        nextState === 'active' &&
+        userRef.current &&
+        (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN)
+      ) {
+        connectWs(userRef.current.user_id);
+      }
+    });
+    return () => sub.remove();
+  }, []);
 
   useEffect(() => {
     if (user) {
-      setTranscripts([]);
       setLiveNotes([]);
-      setGeneratedTitle('');
-      setSavedBanner(false);
+      setAlerts([]);
       connectWs(user.user_id);
       fetchTriggers(user.user_id);
       fetchSavedNotes(user.user_id);
+    } else {
+      cleanupWs();
     }
-    return () => {
-      if (wsRef.current) wsRef.current.close();
-    };
+    return () => cleanupWs();
   }, [user]);
-
-  const sendPhrase = () => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && simPhrase.trim()) {
-      wsRef.current.send(simPhrase.trim());
-    }
-  };
 
   // ==========================================================
   // LOGIN / SIGNUP SCREEN
@@ -309,13 +373,18 @@ export default function App() {
                 style={[styles.pillBtn, { backgroundColor: theme.subtle }]}
                 onPress={() => setDarkMode(!darkMode)}
               >
-                <Text style={[styles.pillBtnText, { color: theme.text }]}>
+                <Text
+                  numberOfLines={1}
+                  style={[styles.pillBtnText, { color: theme.text }]}
+                >
                   {darkMode ? 'Light' : 'Dark'}
                 </Text>
               </TouchableOpacity>
             </View>
-            <Text style={[styles.mutedText, { color: theme.muted, marginTop: 4, marginBottom: 18 }]}>
-              {authMode === 'login' ? 'Sign in to your study workspace' : 'Create a student account'}
+            <Text style={[styles.mutedText, { color: theme.muted, marginTop: 6, marginBottom: 18 }]}>
+              {authMode === 'login'
+                ? 'Sign in with the same account used on Windows'
+                : 'Create a student account'}
             </Text>
 
             <Text style={[styles.label, { color: theme.muted }]}>Server URL (Ngrok)</Text>
@@ -365,8 +434,25 @@ export default function App() {
               style={[styles.primaryBtn, { backgroundColor: theme.accent }]}
               onPress={handleAuth}
             >
-              <Text style={styles.primaryBtnText}>
+              <Text numberOfLines={1} style={styles.primaryBtnText}>
                 {authMode === 'login' ? 'Sign In' : 'Create Account'}
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[
+                styles.primaryBtn,
+                {
+                  backgroundColor: theme.bg,
+                  borderWidth: 1,
+                  borderColor: theme.border,
+                  marginTop: 10,
+                },
+              ]}
+              onPress={startGoogleLogin}
+            >
+              <Text numberOfLines={1} style={[styles.primaryBtnText, { color: theme.text }]}>
+                G   Continue with Google
               </Text>
             </TouchableOpacity>
 
@@ -388,39 +474,81 @@ export default function App() {
   }
 
   // ==========================================================
-  // MAIN WORKSPACE SHELL
+  // MAIN COMPANION WORKSPACE SHELL
   // ==========================================================
-  const firstName = user.name.split()[0];
+  const firstName = user.name.split(' ')[0];
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.headerBg }]}>
       <StatusBar barStyle="light-content" />
 
+      {/* SLIDE-DOWN TOP IN-APP ALERT BANNER (Matching UI Palette) */}
+      {topBanner && (
+        <Animated.View
+          style={[
+            styles.topBanner,
+            {
+              backgroundColor: theme.headerBg,
+              borderColor: '#79B8A8',
+              transform: [{ translateY: bannerAnim }],
+            },
+          ]}
+        >
+          <View style={styles.rowBetween}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, flex: 1 }}>
+              <View style={styles.logoMarkSmall} />
+              <Text numberOfLines={1} style={styles.bannerTitle}>
+                {topBanner.title}
+              </Text>
+            </View>
+            <TouchableOpacity
+              onPress={() => {
+                Vibration.cancel();
+                hideInAppBanner();
+              }}
+              style={styles.bannerCloseBtn}
+            >
+              <Text numberOfLines={1} style={styles.bannerCloseText}>
+                Dismiss
+              </Text>
+            </TouchableOpacity>
+          </View>
+          <Text numberOfLines={3} style={styles.bannerBody}>
+            {topBanner.body}
+          </Text>
+        </Animated.View>
+      )}
+
       {/* Top Forest-Charcoal Brand Header */}
       <View style={[styles.navbar, { backgroundColor: theme.headerBg }]}>
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, flexShrink: 1 }}>
           <View style={styles.logoMark} />
-          <View>
-            <Text style={styles.navTitle}>EchoNote</Text>
-            <Text style={styles.navSub}>
-              {user.name} • {connected ? 'Connected' : 'Offline'}
+          <View style={{ flexShrink: 1 }}>
+            <Text numberOfLines={1} style={styles.navTitle}>
+              EchoNote
+            </Text>
+            <Text numberOfLines={1} style={styles.navSub}>
+              {firstName} • {connected ? 'Armed' : 'Reconnecting'}
             </Text>
           </View>
         </View>
-        <View style={{ flexDirection: 'row', gap: 8 }}>
+
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flexShrink: 0 }}>
           {!connected && (
             <TouchableOpacity
               style={[styles.pillBtn, { backgroundColor: theme.accent }]}
               onPress={() => connectWs(user.user_id)}
             >
-              <Text style={[styles.pillBtnText, { color: '#FFFFFF' }]}>Reconnect</Text>
+              <Text numberOfLines={1} style={[styles.pillBtnText, { color: '#FFFFFF' }]}>
+                Sync
+              </Text>
             </TouchableOpacity>
           )}
           <TouchableOpacity
             style={[styles.pillBtn, { backgroundColor: '#253530' }]}
             onPress={() => setDarkMode(!darkMode)}
           >
-            <Text style={[styles.pillBtnText, { color: '#E2E8F0' }]}>
+            <Text numberOfLines={1} style={[styles.pillBtnText, { color: '#E2E8F0' }]}>
               {darkMode ? 'Light' : 'Dark'}
             </Text>
           </TouchableOpacity>
@@ -428,25 +556,29 @@ export default function App() {
             style={[styles.pillBtn, { borderWidth: 1, borderColor: '#253530' }]}
             onPress={() => setUser(null)}
           >
-            <Text style={[styles.pillBtnText, { color: '#A3B1AC' }]}>Exit</Text>
+            <Text numberOfLines={1} style={[styles.pillBtnText, { color: '#A3B1AC' }]}>
+              Exit
+            </Text>
           </TouchableOpacity>
         </View>
       </View>
 
       {/* Warm Alabaster Canvas */}
       <View style={{ flex: 1, backgroundColor: theme.bg }}>
-        {/* Greeting + Away Mode Row */}
+        {/* Greeting + Alarm Switch Row */}
         <View style={styles.greetingRow}>
-          <View>
-            <Text style={[styles.mutedText, { color: theme.muted }]}>
+          <View style={{ flex: 1, paddingRight: 8 }}>
+            <Text numberOfLines={1} style={[styles.mutedText, { color: theme.muted }]}>
               {new Date().toDateString()}
             </Text>
-            <Text style={[styles.greetingTitle, { color: theme.text }]}>
+            <Text numberOfLines={1} style={[styles.greetingTitle, { color: theme.text }]}>
               Hello, {firstName}
             </Text>
           </View>
           <View style={[styles.awayPill, { backgroundColor: theme.card, borderColor: theme.border }]}>
-            <Text style={[styles.awayLabel, { color: theme.text }]}>Away mode</Text>
+            <Text numberOfLines={1} style={[styles.awayLabel, { color: theme.text }]}>
+              Alarm
+            </Text>
             <Switch
               value={awayMode}
               onValueChange={setAwayMode}
@@ -459,7 +591,7 @@ export default function App() {
         {/* Navigation Tabs */}
         <View style={styles.tabBar}>
           {[
-            { key: 'dashboard', label: 'Dashboard' },
+            { key: 'dashboard', label: 'Overview' },
             { key: 'alerts', label: `Alerts (${alerts.length})` },
             { key: 'keywords', label: 'Keywords' },
             { key: 'notes', label: 'Notes' },
@@ -480,6 +612,9 @@ export default function App() {
               }}
             >
               <Text
+                numberOfLines={1}
+                adjustsFontSizeToFit
+                minimumFontScale={0.85}
                 style={[
                   styles.tabLabel,
                   { color: activeTab === t.key ? '#FFFFFF' : theme.text },
@@ -492,10 +627,9 @@ export default function App() {
         </View>
 
         <ScrollView style={styles.body}>
-          {/* TAB 1: DASHBOARD */}
+          {/* TAB 1: OVERVIEW */}
           {activeTab === 'dashboard' && (
             <>
-              {/* Active Keyword Chips */}
               {triggers.length > 0 && (
                 <ScrollView
                   horizontal
@@ -507,130 +641,72 @@ export default function App() {
                       key={w}
                       style={[styles.kwChip, { backgroundColor: theme.pillBg }]}
                     >
-                      <Text style={[styles.kwChipText, { color: theme.pillText }]}>{w}</Text>
+                      <Text numberOfLines={1} style={[styles.kwChipText, { color: theme.pillText }]}>
+                        {w}
+                      </Text>
                     </View>
                   ))}
                 </ScrollView>
               )}
 
-              {/* Live Session Transcript & Test Card */}
+              {/* Desktop Companion Status & Latest Alert Card */}
               <View style={[styles.card, { backgroundColor: theme.card, borderColor: theme.border }]}>
                 <View style={styles.rowBetween}>
-                  <Text style={[styles.cardTitle, { color: theme.text }]}>Live session</Text>
-                  <View style={[styles.kwChip, { backgroundColor: theme.pillBg }]}>
-                    <Text style={[styles.kwChipText, { color: theme.pillText }]}>
-                      {connected ? '● Synced' : '● Offline'}
+                  <Text style={[styles.cardTitle, { color: theme.text }]}>Desktop Companion</Text>
+                  <View style={[styles.kwChip, { backgroundColor: theme.pillBg, marginRight: 0 }]}>
+                    <Text numberOfLines={1} style={[styles.kwChipText, { color: theme.pillText }]}>
+                      {connected ? '● Armed' : '● Offline'}
                     </Text>
                   </View>
                 </View>
+                <Text style={[styles.mutedText, { color: theme.muted, marginTop: 6, lineHeight: 18 }]}>
+                  {awayMode
+                    ? 'Alarm is ON. You will receive a top banner inside EchoNote and a system notification when using WhatsApp or other apps.'
+                    : 'Alarm is muted. Keyword alerts will log silently below.'}
+                </Text>
 
-                {transcripts.length === 0 ? (
-                  <Text style={[styles.mutedText, { color: theme.muted, marginTop: 8 }]}>
-                    Live lecture speech from your desktop session streams here automatically.
-                  </Text>
-                ) : (
-                  <View style={{ marginTop: 8 }}>
-                    {transcripts.slice(-6).map((item) => (
-                      <View key={item.id} style={styles.transcriptRow}>
-                        <Text style={[styles.transcriptTime, { color: theme.muted }]}>
-                          {item.time}
-                        </Text>
-                        <Text style={[styles.transcriptText, { color: theme.text }]}>
-                          {item.text}
-                        </Text>
-                      </View>
-                    ))}
+                {alerts.length > 0 && (
+                  <View style={[styles.alertItem, { borderColor: theme.border }]}>
+                    <View style={styles.rowBetween}>
+                      <Text style={[styles.alertHead, { color: theme.amberText }]}>
+                        Latest: {alerts[0].event_type.toLowerCase().replace('_', ' ')}
+                      </Text>
+                      <Text style={[styles.mutedText, { color: theme.muted }]}>{alerts[0].time}</Text>
+                    </View>
+                    <Text style={[styles.alertBody, { color: theme.text }]}>
+                      {alerts[0].summary}
+                    </Text>
                   </View>
                 )}
-
-                <View style={{ flexDirection: 'row', gap: 8, marginTop: 12 }}>
-                  <TextInput
-                    style={[
-                      styles.input,
-                      {
-                        flex: 1,
-                        marginBottom: 0,
-                        backgroundColor: theme.bg,
-                        borderColor: theme.border,
-                        color: theme.text,
-                      },
-                    ]}
-                    value={simPhrase}
-                    onChangeText={setSimPhrase}
-                    placeholder="Simulate phrase..."
-                    placeholderTextColor={theme.muted}
-                  />
-                  <TouchableOpacity
-                    style={[styles.smallBtn, { backgroundColor: theme.accent }]}
-                    onPress={sendPhrase}
-                  >
-                    <Text style={styles.primaryBtnText}>Send</Text>
-                  </TouchableOpacity>
-                </View>
               </View>
 
-              {/* Auto Notes Card */}
+              {/* Read-Only Live Desktop Auto-Notes Feed */}
               <View style={[styles.card, { backgroundColor: theme.card, borderColor: theme.border }]}>
                 <View style={styles.rowBetween}>
-                  <Text style={[styles.cardTitle, { color: theme.text }]}>Auto notes</Text>
-                  <View style={{ flexDirection: 'row', gap: 6 }}>
-                    <TouchableOpacity
-                      style={[styles.pillBtn, { borderWidth: 1, borderColor: theme.border }]}
-                      onPress={startNewNoteSession}
-                    >
-                      <Text style={[styles.pillBtnText, { color: theme.muted }]}>Clear</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      style={[styles.pillBtn, { backgroundColor: theme.pillBg }]}
-                      onPress={saveCurrentSession}
-                    >
-                      <Text style={[styles.pillBtnText, { color: theme.pillText }]}>Save</Text>
-                    </TouchableOpacity>
-                  </View>
+                  <Text style={[styles.cardTitle, { color: theme.text }]}>Live Lecture Notes</Text>
+                  <TouchableOpacity
+                    style={[styles.pillBtn, { backgroundColor: theme.subtle }]}
+                    onPress={() => {
+                      setActiveTab('notes');
+                      fetchSavedNotes(user.user_id);
+                    }}
+                  >
+                    <Text numberOfLines={1} style={[styles.pillBtnText, { color: theme.text }]}>
+                      Archive
+                    </Text>
+                  </TouchableOpacity>
                 </View>
 
-                {generatedTitle ? (
-                  <View style={[styles.titleBanner, { borderBottomColor: theme.border }]}>
-                    <Text style={[styles.generatedTitleText, { color: theme.text }]}>
-                      {generatedTitle}
-                    </Text>
-                  </View>
-                ) : null}
-
                 {liveNotes.length === 0 ? (
-                  <Text style={[styles.mutedText, { color: theme.muted, marginTop: 8 }]}>
-                    English study notes generate automatically every 4 sentences.
+                  <Text style={[styles.mutedText, { color: theme.muted, marginTop: 8, lineHeight: 18 }]}>
+                    Notes generated while your Windows app is listening stream here automatically.
                   </Text>
                 ) : (
-                  <>
-                    {liveNotes.map((n, i) => (
-                      <Text key={i} style={[styles.noteLine, { color: theme.text }]}>
-                        • {n}
-                      </Text>
-                    ))}
-                    <View
-                      style={{
-                        flexDirection: 'row',
-                        justifyContent: 'space-between',
-                        alignItems: 'center',
-                        marginTop: 12,
-                      }}
-                    >
-                      <TouchableOpacity
-                        style={[styles.pillBtn, { backgroundColor: theme.subtle }]}
-                        onPress={generateSessionTitle}
-                      >
-                        <Text style={[styles.pillBtnText, { color: theme.text }]}>
-                          Generate Title
-                        </Text>
-                      </TouchableOpacity>
-                      {savedBanner ? (
-                        <Text style={{ color: theme.pillText, fontSize: 12, fontWeight: '600' }}>
-                          ✓ Saved to Notes
-                        </Text>
-                      ) : null}
-                    </View>
-                  </>
+                  liveNotes.slice(-6).map((n, i) => (
+                    <Text key={i} style={[styles.noteLine, { color: theme.text }]}>
+                      • {n}
+                    </Text>
+                  ))
                 )}
               </View>
             </>
@@ -641,15 +717,15 @@ export default function App() {
             <View style={[styles.card, { backgroundColor: theme.card, borderColor: theme.border }]}>
               <View style={styles.rowBetween}>
                 <Text style={[styles.cardTitle, { color: theme.text }]}>Alerts</Text>
-                <View style={[styles.kwChip, { backgroundColor: theme.amberBg }]}>
-                  <Text style={[styles.kwChipText, { color: theme.amberText }]}>
+                <View style={[styles.kwChip, { backgroundColor: theme.amberBg, marginRight: 0 }]}>
+                  <Text numberOfLines={1} style={[styles.kwChipText, { color: theme.amberText }]}>
                     {alerts.length} new
                   </Text>
                 </View>
               </View>
               {alerts.length === 0 ? (
                 <Text style={[styles.mutedText, { color: theme.muted, marginTop: 8 }]}>
-                  No alerts triggered yet.
+                  No keyword alerts received yet.
                 </Text>
               ) : (
                 alerts.map((a) => (
@@ -675,7 +751,7 @@ export default function App() {
             <View style={[styles.card, { backgroundColor: theme.card, borderColor: theme.border }]}>
               <Text style={[styles.cardTitle, { color: theme.text }]}>Trigger Keywords</Text>
               <Text style={[styles.mutedText, { color: theme.muted, marginTop: 2, marginBottom: 12 }]}>
-                Customize the default & personal words that trigger instant alerts.
+                Changes sync instantly with your Windows app listener.
               </Text>
 
               <View style={{ flexDirection: 'row', gap: 8, marginBottom: 14 }}>
@@ -699,7 +775,9 @@ export default function App() {
                   style={[styles.smallBtn, { backgroundColor: theme.accent }]}
                   onPress={addTrigger}
                 >
-                  <Text style={styles.primaryBtnText}>Add</Text>
+                  <Text numberOfLines={1} style={styles.primaryBtnText}>
+                    Add
+                  </Text>
                 </TouchableOpacity>
               </View>
 
@@ -709,8 +787,13 @@ export default function App() {
                   style={[styles.triggerRow, { backgroundColor: theme.bg, borderColor: theme.border }]}
                 >
                   <Text style={[styles.triggerWord, { color: theme.text }]}>{w}</Text>
-                  <TouchableOpacity onPress={() => deleteTrigger(w)}>
-                    <Text style={styles.removeText}>Remove</Text>
+                  <TouchableOpacity
+                    style={{ paddingHorizontal: 8, paddingVertical: 4 }}
+                    onPress={() => deleteTrigger(w)}
+                  >
+                    <Text numberOfLines={1} style={styles.removeText}>
+                      Remove
+                    </Text>
                   </TouchableOpacity>
                 </View>
               ))}
@@ -743,8 +826,13 @@ export default function App() {
                           {item.created_at}
                         </Text>
                       </View>
-                      <TouchableOpacity onPress={() => deleteSavedNote(item.id)}>
-                        <Text style={styles.removeText}>Delete</Text>
+                      <TouchableOpacity
+                        style={{ paddingHorizontal: 8, paddingVertical: 4 }}
+                        onPress={() => deleteSavedNote(item.id)}
+                      >
+                        <Text numberOfLines={1} style={styles.removeText}>
+                          Delete
+                        </Text>
                       </TouchableOpacity>
                     </View>
                     <Text style={[styles.noteLine, { color: theme.text }]}>{item.content}</Text>
@@ -762,7 +850,33 @@ export default function App() {
 const styles = StyleSheet.create({
   container: { flex: 1, paddingTop: Platform.OS === 'android' ? 28 : 0 },
   authScroll: { flexGrow: 1, justifyContent: 'center', padding: 20 },
-  logoMark: { width: 22, height: 22, borderRadius: 6, backgroundColor: '#79B8A8' },
+  logoMark: { width: 22, height: 22, borderRadius: 6, backgroundColor: '#79B8A8', flexShrink: 0 },
+  logoMarkSmall: { width: 14, height: 14, borderRadius: 4, backgroundColor: '#79B8A8', flexShrink: 0 },
+  topBanner: {
+    position: 'absolute',
+    top: 0,
+    left: 14,
+    right: 14,
+    zIndex: 999,
+    elevation: 12,
+    borderWidth: 1.5,
+    borderRadius: 14,
+    padding: 14,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.25,
+    shadowRadius: 10,
+  },
+  bannerTitle: { color: '#79B8A8', fontSize: 13, fontWeight: '700', flexShrink: 1 },
+  bannerBody: { color: '#F8FAFC', fontSize: 13, marginTop: 6, lineHeight: 18 },
+  bannerCloseBtn: {
+    backgroundColor: '#253530',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 8,
+    flexShrink: 0,
+  },
+  bannerCloseText: { color: '#E2E8F0', fontSize: 11, fontWeight: '600' },
   card: {
     borderWidth: 1,
     borderRadius: 14,
@@ -782,29 +896,41 @@ const styles = StyleSheet.create({
   },
   primaryBtn: {
     paddingVertical: 12,
+    paddingHorizontal: 16,
     borderRadius: 10,
     alignItems: 'center',
+    justifyContent: 'center',
     marginTop: 4,
   },
   smallBtn: {
-    paddingHorizontal: 16,
+    paddingHorizontal: 18,
     borderRadius: 10,
+    alignItems: 'center',
     justifyContent: 'center',
+    flexShrink: 0,
   },
-  primaryBtnText: { color: '#FFFFFF', fontWeight: '600', fontSize: 13 },
+  primaryBtnText: { color: '#FFFFFF', fontWeight: '600', fontSize: 13, textAlign: 'center' },
   switchBtn: { alignItems: 'center', marginTop: 14 },
   errorText: { color: '#C2410C', fontSize: 12, marginBottom: 8 },
   navbar: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: 16,
+    paddingHorizontal: 14,
     paddingVertical: 14,
+    gap: 8,
   },
-  navTitle: { fontSize: 18, fontWeight: '700', color: '#F8FAFC' },
+  navTitle: { fontSize: 17, fontWeight: '700', color: '#F8FAFC' },
   navSub: { fontSize: 11, color: '#A3B1AC' },
-  pillBtn: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8 },
-  pillBtnText: { fontSize: 12, fontWeight: '600' },
+  pillBtn: {
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+  },
+  pillBtnText: { fontSize: 12, fontWeight: '600', textAlign: 'center' },
   greetingRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -814,7 +940,7 @@ const styles = StyleSheet.create({
     paddingBottom: 8,
   },
   greetingTitle: {
-    fontSize: 22,
+    fontSize: 21,
     fontWeight: '700',
     fontFamily: Platform.OS === 'ios' ? 'Georgia' : 'serif',
   },
@@ -827,32 +953,33 @@ const styles = StyleSheet.create({
     paddingRight: 6,
     paddingVertical: 2,
     gap: 6,
+    flexShrink: 0,
   },
   awayLabel: { fontSize: 12, fontWeight: '600' },
   tabBar: { flexDirection: 'row', paddingHorizontal: 16, paddingTop: 6, gap: 6 },
   tabItem: {
     flex: 1,
-    paddingVertical: 8,
+    paddingVertical: 9,
+    paddingHorizontal: 4,
     borderRadius: 10,
     borderWidth: 1,
     alignItems: 'center',
+    justifyContent: 'center',
   },
-  tabLabel: { fontSize: 12, fontWeight: '600' },
+  tabLabel: { fontSize: 12, fontWeight: '600', textAlign: 'center' },
   body: { flex: 1, padding: 16 },
   cardTitle: { fontSize: 15, fontWeight: '700' },
   mutedText: { fontSize: 12 },
   kwChip: {
-    paddingHorizontal: 10,
+    paddingHorizontal: 12,
     paddingVertical: 5,
     borderRadius: 12,
     marginRight: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
   },
-  kwChipText: { fontSize: 11, fontWeight: '600' },
-  transcriptRow: { flexDirection: 'row', gap: 10, marginBottom: 8 },
-  transcriptTime: { fontSize: 11, width: 38, marginTop: 2 },
-  transcriptText: { fontSize: 13, flex: 1, lineHeight: 18 },
-  titleBanner: { borderBottomWidth: 1, paddingVertical: 8, marginTop: 8 },
-  generatedTitleText: { fontSize: 14, fontWeight: '700' },
+  kwChipText: { fontSize: 11, fontWeight: '600', textAlign: 'center' },
   alertItem: { borderTopWidth: 1, paddingTop: 10, marginTop: 10 },
   alertHead: { fontSize: 13, fontWeight: '700' },
   alertBody: { fontSize: 13, marginVertical: 3 },
