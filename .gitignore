@@ -1,0 +1,31 @@
+# Environment & Secrets
+.env
+*.env
+
+# Python Virtual Environment & Cache
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.spec
+
+# Local SQLite Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Node / Expo Mobile App
+mobile-app/node_modules/
+mobile-app/.expo/
+mobile-app/dist/
+mobile-app/web-build/
+npm-debug.log*
+yarn-error.log*
+
+# OS & Editor Files
+.DS_Store
+Thumbs.db
+.vscode/

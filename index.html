@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EchoNote — AFK Study Copilot
+
+  </title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-900 text-white min-h-screen p-8 font-sans">
+  <div class="max-w-5xl mx-auto">
+    
+    <!-- Header -->
+    <header class="flex justify-between items-center mb-8 border-b border-slate-700 pb-4">
+      <div>
+        <h1 class="text-3xl font-extrabold text-blue-400">EchoNote <span class="text-slate-400 text-lg font-normal">| AFK Copilot</span></h1>
+        <p class="text-slate-400 text-sm mt-1">Real-Time Bilingual Meeting Trigger & Note-Taking Assistant</p>
+      </div>
+      <div id="status-badge" class="px-3 py-1 rounded-full text-xs font-semibold bg-red-900/50 text-red-400 border border-red-700">
+        Backend: Connecting...
+      </div>
+    </header>
+
+    <!-- Controls -->
+    <div class="bg-slate-800 p-6 rounded-xl border border-slate-700 mb-6 shadow-lg flex flex-wrap items-center justify-between gap-4">
+      <div>
+        <h2 class="text-lg font-bold text-slate-200">Audio Stream Monitor</h2>
+        <p class="text-slate-400 text-sm">Select your Google Meet, Zoom, or System Audio tab to monitor.</p>
+      </div>
+      <div class="flex gap-3">
+        <button id="start-btn" onclick="toggleMonitoring()" class="bg-blue-600 hover:bg-blue-500 text-white font-bold px-6 py-3 rounded-lg transition-all shadow-md">
+          Start Monitoring
+        </button>
+        <button onclick="exportNotes()" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-5 py-3 rounded-lg transition-all shadow-md">
+          Save Notes (.txt)
+        </button>
+      </div>
+    </div>
+
+    <!-- Quick Test Simulator -->
+    <div class="bg-slate-800 p-6 rounded-xl border border-slate-700 mb-8 shadow-lg">
+      <h2 class="text-md font-bold mb-2 text-slate-300">Simulate Spoken Phrase (Direct WebSocket Stream)</h2>
+      <p class="text-slate-400 text-xs mb-3">Send 4 phrases to trigger an automatic English note summary, or send a trigger word for an instant alert.</p>
+      <div class="flex gap-2">
+        <input type="text" id="test-input" value="Areesha, haazri lag rahi hai mic on karo" class="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-slate-200 focus:outline-none focus:border-blue-500">
+        <button onclick="sendTestPhrase()" class="bg-blue-600 hover:bg-blue-500 px-5 py-2 rounded-lg font-bold text-sm transition-all shadow-md">
+          Send Phrase
+        </button>
+      </div>
+    </div>
+
+    <!-- Two-Column Grid: Live Alerts + Auto Meeting Notes -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+      
+      <!-- Column 1: Priority Alerts -->
+      <div class="space-y-4">
+        <h2 class="text-xl font-bold text-red-400">Live Priority Alerts</h2>
+        <div id="alert-container" class="space-y-3">
+          <div id="empty-placeholder" class="p-4 bg-slate-800/50 border border-slate-700/50 rounded-lg text-slate-500 text-sm text-center">
+            No triggers detected yet...
+          </div>
+        </div>
+      </div>
+
+      <!-- Column 2: Auto-Generated Meeting Notes -->
+      <div class="space-y-4">
+        <h2 class="text-xl font-bold text-emerald-400">Live English Notes</h2>
+        <div id="notes-container" class="p-5 bg-slate-800 border border-slate-700 rounded-xl space-y-2 min-h-[200px]">
+          <p id="notes-placeholder" class="text-slate-500 text-sm text-center">
+            Notes will auto-generate every 4 sentences...
+          </p>
+          <ul id="notes-list" class="list-disc list-inside space-y-2 text-slate-200 text-sm"></ul>
+        </div>
+      </div>
+
+    </div>
+
+  </div>
+
+  <script>
+    let ws = null;
+    let isMonitoring = false;
+
+    function connectWebSocket() {
+      ws = new WebSocket("ws://127.0.0.1:8000/ws/stream");
+
+      ws.onopen = () => {
+        const badge = document.getElementById("status-badge");
+        badge.innerText = "Backend: Connected";
+        badge.className = "px-3 py-1 rounded-full text-xs font-semibold bg-emerald-900/50 text-emerald-400 border border-emerald-700";
+      };
+
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        
+        if (data.type === "MEETING_NOTE" && data.notes) {
+          const placeholder = document.getElementById("notes-placeholder");
+          if (placeholder) placeholder.remove();
+          
+          const list = document.getElementById("notes-list");
+          data.notes.forEach(note => {
+            const li = document.createElement("li");
+            li.innerText = note;
+            list.appendChild(li);
+          });
+        } else if (data.trigger_detected) {
+          triggerAlertHUD(data);
+        }
+      };
+
+      ws.onclose = () => {
+        const badge = document.getElementById("status-badge");
+        badge.innerText = "Backend: Disconnected";
+        badge.className = "px-3 py-1 rounded-full text-xs font-semibold bg-red-900/50 text-red-400 border border-red-700";
+        setTimeout(connectWebSocket, 3000);
+      };
+    }
+
+    function toggleMonitoring() {
+      const btn = document.getElementById("start-btn");
+      if (!isMonitoring) {
+        navigator.mediaDevices.getDisplayMedia({ video: true, audio: true })
+          .then(stream => {
+            isMonitoring = true;
+            btn.innerText = "Stop Monitoring";
+            btn.className = "bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-6 py-3 rounded-lg transition-all shadow-md";
+            
+            const audioTrack = stream.getAudioTracks()[0];
+            if (!audioTrack) {
+              alert("Please make sure to check 'Share tab audio' when selecting the window!");
+            }
+          })
+          .catch(err => console.error("Audio capture canceled:", err));
+      } else {
+        isMonitoring = false;
+        btn.innerText = "Start Monitoring";
+        btn.className = "bg-blue-600 hover:bg-blue-500 text-white font-bold px-6 py-3 rounded-lg transition-all shadow-md";
+      }
+    }
+
+    function sendTestPhrase() {
+      const input = document.getElementById("test-input");
+      let phrase = input.value.trim();
+      
+      if (!phrase) {
+        phrase = "Areesha, haazri lag rahi hai mic on karo";
+        input.value = phrase;
+      }
+
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(phrase);
+      } else {
+        alert("WebSocket backend is not connected!");
+      }
+    }
+
+    function triggerAlertHUD(alert) {
+      try {
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = audioCtx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(587.33, audioCtx.currentTime);
+        osc.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.3);
+      } catch (e) {
+        console.log("Audio play blocked by browser policy");
+      }
+
+      const container = document.getElementById("alert-container");
+      const emptyPlaceholder = document.getElementById("empty-placeholder");
+      if (emptyPlaceholder) emptyPlaceholder.remove();
+
+      const alertCard = document.createElement("div");
+      const badgeColor = alert.urgency === "HIGH" ? "bg-red-600" : "bg-amber-600";
+      
+      alertCard.className = "p-5 border-l-4 border-red-500 bg-slate-800 rounded-r-xl shadow-xl border-y border-r border-slate-700";
+      alertCard.innerHTML = `
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-xs font-bold text-white ${badgeColor} px-2.5 py-0.5 rounded-full uppercase tracking-wider">
+            ${alert.event_type} — ${alert.urgency}
+          </span>
+          <span class="text-xs text-slate-400">${new Date().toLocaleTimeString()}</span>
+        </div>
+        <p class="text-slate-100 font-semibold text-base">${alert.summary}</p>
+        <p class="text-slate-400 text-xs mt-2 italic">Heard: "${alert.original_text}"</p>
+      `;
+
+      container.prepend(alertCard);
+    }
+
+    function exportNotes() {
+      const notes = Array.from(document.querySelectorAll("#notes-list li"))
+        .map(li => "• " + li.innerText)
+        .join("\n");
+      
+      if (!notes) {
+        alert("No notes generated yet!");
+        return;
+      }
+
+      const blob = new Blob([notes], { type: "text/plain;charset=utf-8" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = `EchoNote_Notes_${new Date().toISOString().slice(0,10)}.txt`;
+      link.click();
+    }
+
+    connectWebSocket();
+  </script>
+</body>
+</html>
