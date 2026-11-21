@@ -17,6 +17,8 @@ import {
 } from 'react-native';
 import * as Notifications from 'expo-notifications';
 
+const FIREBASE_DB_URL = 'https://echonote-170b6-default-rtdb.firebaseio.com';
+
 // Configure foreground & background notification behavior
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -28,7 +30,7 @@ Notifications.setNotificationHandler({
 });
 
 export default function App() {
-  const [serverUrl, setServerUrl] = useState('https://cheddar-banjo-agile.ngrok-free.dev');
+  const [serverUrl, setServerUrl] = useState('https://echonote-api.echonoteapp.workers.dev');
   const [darkMode, setDarkMode] = useState(false);
   const [awayMode, setAwayMode] = useState(true);
 
@@ -56,14 +58,10 @@ export default function App() {
   const bannerAnim = useRef(new Animated.Value(-140)).current;
   const bannerTimerRef = useRef(null);
 
-  const wsRef = useRef(null);
-  const pingIntervalRef = useRef(null);
-  const reconnectTimeoutRef = useRef(null);
   const appStateRef = useRef(AppState.currentState);
   const awayModeRef = useRef(awayMode);
   awayModeRef.current = awayMode;
-  const userRef = useRef(user);
-  userRef.current = user;
+  const lastAlertIdRef = useRef(null);
 
   // Editorial Palette matching EchoNote Desktop
   const theme = darkMode
@@ -97,13 +95,9 @@ export default function App() {
       };
 
   const cleanHttpUrl = () => serverUrl.trim().replace(/\/+$/, '');
-  const getWsUrl = (userId) =>
-    cleanHttpUrl().replace(/^https:\/\//i, 'wss://').replace(/^http:\/\//i, 'ws://') +
-    `/ws/stream?user_id=${userId}`;
 
   const apiHeaders = {
     'Content-Type': 'application/json',
-    'ngrok-skip-browser-warning': 'true',
   };
 
   // --- REQUEST NOTIFICATION PERMISSIONS ON STARTUP ---
@@ -116,6 +110,11 @@ export default function App() {
         }
       } catch (e) {}
     })();
+
+    const sub = AppState.addEventListener('change', (nextState) => {
+      appStateRef.current = nextState;
+    });
+    return () => sub.remove();
   }, []);
 
   // --- TOP SLIDE-DOWN IN-APP BANNER ---
@@ -174,8 +173,9 @@ export default function App() {
         return;
       }
       setUser(data);
+      if (data.keywords) setTriggers(data.keywords);
     } catch (e) {
-      setAuthError('Unable to reach server. Check Ngrok URL.');
+      setAuthError('Unable to reach EchoNote Cloud. Check your internet connection.');
     }
   };
 
@@ -194,6 +194,7 @@ export default function App() {
         if (data.authenticated && data.user) {
           clearInterval(interval);
           setUser(data.user);
+          if (data.user.keywords) setTriggers(data.user.keywords);
         }
       } catch (e) {}
     }, 2000);
@@ -206,33 +207,37 @@ export default function App() {
     try {
       const res = await fetch(`${cleanHttpUrl()}/api/triggers/${uid}`, { headers: apiHeaders });
       const data = await res.json();
-      if (data.triggers) setTriggers(data.triggers);
+      if (data.keywords) setTriggers(data.keywords);
     } catch (e) {}
   };
 
   const addTrigger = async () => {
-    if (!newTrigger.trim() || !user) return;
+    const word = newTrigger.trim();
+    if (!word || !user) return;
+    const updated = Array.from(new Set([...triggers, word]));
     try {
-      const res = await fetch(`${cleanHttpUrl()}/api/triggers`, {
+      const res = await fetch(`${cleanHttpUrl()}/api/triggers/${user.user_id}`, {
         method: 'POST',
         headers: apiHeaders,
-        body: JSON.stringify({ user_id: user.user_id, word: newTrigger.trim() }),
+        body: JSON.stringify({ keywords: updated }),
       });
       const data = await res.json();
-      if (data.triggers) setTriggers(data.triggers);
+      if (data.keywords) setTriggers(data.keywords);
       setNewTrigger('');
     } catch (e) {}
   };
 
   const deleteTrigger = async (word) => {
     if (!user) return;
+    const updated = triggers.filter((w) => w !== word);
     try {
-      const res = await fetch(
-        `${cleanHttpUrl()}/api/triggers/${user.user_id}/${encodeURIComponent(word)}`,
-        { method: 'DELETE', headers: apiHeaders }
-      );
+      const res = await fetch(`${cleanHttpUrl()}/api/triggers/${user.user_id}`, {
+        method: 'POST',
+        headers: apiHeaders,
+        body: JSON.stringify({ keywords: updated }),
+      });
       const data = await res.json();
-      if (data.triggers) setTriggers(data.triggers);
+      if (data.keywords) setTriggers(data.keywords);
     } catch (e) {}
   };
 
@@ -244,115 +249,89 @@ export default function App() {
     } catch (e) {}
   };
 
-  const deleteSavedNote = async (noteId) => {
-    if (!user) return;
-    try {
-      await fetch(`${cleanHttpUrl()}/api/notes/${noteId}`, {
-        method: 'DELETE',
-        headers: apiHeaders,
-      });
-      fetchSavedNotes(user.user_id);
-    } catch (e) {}
-  };
-
-  // --- PERSISTENT WEBSOCKET WITH HEARTBEAT & AUTO-RECONNECT ---
-  const cleanupWs = () => {
-    if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
-    if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-    if (wsRef.current) {
-      wsRef.current.onclose = null;
-      wsRef.current.close();
-      wsRef.current = null;
+  // --- REAL-TIME FIREBASE REST LISTENER (ZERO-DEPENDENCY) ---
+  useEffect(() => {
+    if (!user) {
+      setConnected(false);
+      return;
     }
-  };
 
-  const connectWs = (uid) => {
-    cleanupWs();
-    const ws = new WebSocket(getWsUrl(uid), null, {
-      headers: { 'ngrok-skip-browser-warning': 'true' },
-    });
-    wsRef.current = ws;
+    setLiveNotes([]);
+    setAlerts([]);
+    lastAlertIdRef.current = null;
+    fetchTriggers(user.user_id);
+    fetchSavedNotes(user.user_id);
 
-    ws.onopen = () => {
-      setConnected(true);
-      pingIntervalRef.current = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send('');
-        }
-      }, 15000);
-    };
+    let isInitialLoad = true;
+    let cancelled = false;
 
-    ws.onmessage = (event) => {
+    const pollFirebase = async () => {
+      if (cancelled) return;
       try {
-        const data = JSON.parse(event.data);
-        if (data.type === 'MEETING_NOTE' && data.notes) {
-          setLiveNotes((prev) => [...prev, ...data.notes]);
-        } else if (data.trigger_detected) {
-          const alertTitle = `EchoNote • ${(data.event_type || 'ALERT').replace('_', ' ')}`;
-          const alertBody = data.summary || data.original_text;
+        const [alertRes, notesRes] = await Promise.all([
+          fetch(`${FIREBASE_DB_URL}/live_alerts/${user.user_id}.json`),
+          fetch(`${FIREBASE_DB_URL}/notes/${user.user_id}.json`),
+        ]);
+        if (cancelled) return;
+        setConnected(true);
 
-          if (awayModeRef.current) {
-            Vibration.vibrate([0, 600, 250, 600, 250, 800]);
-            if (AppState.currentState !== 'active') {
-              triggerSystemNotification(alertTitle, alertBody);
-            } else {
-              showInAppBanner(alertTitle, alertBody);
+        const data = await alertRes.json();
+        if (data && data.id) {
+          if (isInitialLoad) {
+            isInitialLoad = false;
+            lastAlertIdRef.current = data.id;
+          } else if (data.id !== lastAlertIdRef.current) {
+            lastAlertIdRef.current = data.id;
+            const kwLabel = (data.keyword || 'ALERT').toUpperCase();
+            const alertTitle = `EchoNote • ${kwLabel}`;
+            const alertBody = data.transcript || `Keyword "${data.keyword}" detected.`;
+
+            if (awayModeRef.current) {
+              Vibration.vibrate([0, 600, 250, 600, 250, 800]);
+              if (AppState.currentState !== 'active') {
+                triggerSystemNotification(alertTitle, alertBody);
+              } else {
+                showInAppBanner(alertTitle, alertBody);
+              }
             }
+
+            setAlerts((prev) => [
+              {
+                id: data.id,
+                time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                event_type: kwLabel,
+                summary: `Detected "${data.keyword}" in lecture audio.`,
+                original_text: data.transcript || '',
+              },
+              ...prev,
+            ]);
           }
-
-          setAlerts((prev) => [
-            {
-              id: Date.now().toString() + Math.random(),
-              time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-              ...data,
-            },
-            ...prev,
-          ]);
+        } else {
+          isInitialLoad = false;
         }
-      } catch (e) {}
-    };
 
-    ws.onclose = () => {
-      setConnected(false);
-      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
-      if (userRef.current) {
-        reconnectTimeoutRef.current = setTimeout(() => {
-          if (userRef.current) connectWs(userRef.current.user_id);
-        }, 2500);
+        const rawNotes = await notesRes.json();
+        if (rawNotes) {
+          const list = Object.values(rawNotes).sort(
+            (a, b) => (b.created_at || 0) - (a.created_at || 0)
+          );
+          setSavedNotes(list);
+          if (list[0]?.summary) {
+            setLiveNotes(list[0].summary.split('\n').filter(Boolean));
+          }
+        }
+      } catch (e) {
+        if (!cancelled) setConnected(false);
       }
     };
 
-    ws.onerror = () => {
-      setConnected(false);
+    pollFirebase();
+    const timer = setInterval(pollFirebase, 2000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
     };
-  };
-
-  // Monitor AppState transitions (WhatsApp <-> EchoNote) to ensure immediate reconnection
-  useEffect(() => {
-    const sub = AppState.addEventListener('change', (nextState) => {
-      appStateRef.current = nextState;
-      if (
-        nextState === 'active' &&
-        userRef.current &&
-        (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN)
-      ) {
-        connectWs(userRef.current.user_id);
-      }
-    });
-    return () => sub.remove();
-  }, []);
-
-  useEffect(() => {
-    if (user) {
-      setLiveNotes([]);
-      setAlerts([]);
-      connectWs(user.user_id);
-      fetchTriggers(user.user_id);
-      fetchSavedNotes(user.user_id);
-    } else {
-      cleanupWs();
-    }
-    return () => cleanupWs();
   }, [user]);
 
   // ==========================================================
@@ -387,7 +366,7 @@ export default function App() {
                 : 'Create a student account'}
             </Text>
 
-            <Text style={[styles.label, { color: theme.muted }]}>Server URL (Ngrok)</Text>
+            <Text style={[styles.label, { color: theme.muted }]}>Cloud API Endpoint</Text>
             <TextInput
               style={[styles.input, { backgroundColor: theme.bg, borderColor: theme.border, color: theme.text }]}
               value={serverUrl}
@@ -476,13 +455,13 @@ export default function App() {
   // ==========================================================
   // MAIN COMPANION WORKSPACE SHELL
   // ==========================================================
-  const firstName = user.name.split(' ')[0];
+  const firstName = (user.name || 'Student').split(' ')[0];
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.headerBg }]}>
       <StatusBar barStyle="light-content" />
 
-      {/* SLIDE-DOWN TOP IN-APP ALERT BANNER (Matching UI Palette) */}
+      {/* SLIDE-DOWN TOP IN-APP ALERT BANNER */}
       {topBanner && (
         <Animated.View
           style={[
@@ -528,22 +507,23 @@ export default function App() {
               EchoNote
             </Text>
             <Text numberOfLines={1} style={styles.navSub}>
-              {firstName} • {connected ? 'Armed' : 'Reconnecting'}
+              {firstName} • {connected ? 'Cloud Armed' : 'Connecting'}
             </Text>
           </View>
         </View>
 
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flexShrink: 0 }}>
-          {!connected && (
-            <TouchableOpacity
-              style={[styles.pillBtn, { backgroundColor: theme.accent }]}
-              onPress={() => connectWs(user.user_id)}
-            >
-              <Text numberOfLines={1} style={[styles.pillBtnText, { color: '#FFFFFF' }]}>
-                Sync
-              </Text>
-            </TouchableOpacity>
-          )}
+          <TouchableOpacity
+            style={[styles.pillBtn, { backgroundColor: theme.accent }]}
+            onPress={() => {
+              fetchTriggers(user.user_id);
+              fetchSavedNotes(user.user_id);
+            }}
+          >
+            <Text numberOfLines={1} style={[styles.pillBtnText, { color: '#FFFFFF' }]}>
+              Sync
+            </Text>
+          </TouchableOpacity>
           <TouchableOpacity
             style={[styles.pillBtn, { backgroundColor: '#253530' }]}
             onPress={() => setDarkMode(!darkMode)}
@@ -655,7 +635,7 @@ export default function App() {
                   <Text style={[styles.cardTitle, { color: theme.text }]}>Desktop Companion</Text>
                   <View style={[styles.kwChip, { backgroundColor: theme.pillBg, marginRight: 0 }]}>
                     <Text numberOfLines={1} style={[styles.kwChipText, { color: theme.pillText }]}>
-                      {connected ? '● Armed' : '● Offline'}
+                      {connected ? '● Armed' : '● Syncing'}
                     </Text>
                   </View>
                 </View>
@@ -680,10 +660,10 @@ export default function App() {
                 )}
               </View>
 
-              {/* Read-Only Live Desktop Auto-Notes Feed */}
+              {/* Latest Synced Lecture Summary Card */}
               <View style={[styles.card, { backgroundColor: theme.card, borderColor: theme.border }]}>
                 <View style={styles.rowBetween}>
-                  <Text style={[styles.cardTitle, { color: theme.text }]}>Live Lecture Notes</Text>
+                  <Text style={[styles.cardTitle, { color: theme.text }]}>Latest AI Study Notes</Text>
                   <TouchableOpacity
                     style={[styles.pillBtn, { backgroundColor: theme.subtle }]}
                     onPress={() => {
@@ -699,12 +679,12 @@ export default function App() {
 
                 {liveNotes.length === 0 ? (
                   <Text style={[styles.mutedText, { color: theme.muted, marginTop: 8, lineHeight: 18 }]}>
-                    Notes generated while your Windows app is listening stream here automatically.
+                    Notes saved from your Windows app appear here automatically via Firebase.
                   </Text>
                 ) : (
-                  liveNotes.slice(-6).map((n, i) => (
+                  liveNotes.slice(0, 6).map((n, i) => (
                     <Text key={i} style={[styles.noteLine, { color: theme.text }]}>
-                      • {n}
+                      {n}
                     </Text>
                   ))
                 )}
@@ -751,7 +731,7 @@ export default function App() {
             <View style={[styles.card, { backgroundColor: theme.card, borderColor: theme.border }]}>
               <Text style={[styles.cardTitle, { color: theme.text }]}>Trigger Keywords</Text>
               <Text style={[styles.mutedText, { color: theme.muted, marginTop: 2, marginBottom: 12 }]}>
-                Changes sync instantly with your Windows app listener.
+                Changes sync directly with your Windows app listener.
               </Text>
 
               <View style={{ flexDirection: 'row', gap: 8, marginBottom: 14 }}>
@@ -809,35 +789,31 @@ export default function App() {
               {savedNotes.length === 0 ? (
                 <Text style={[styles.mutedText, { color: theme.muted }]}>No saved sessions yet.</Text>
               ) : (
-                savedNotes.map((item) => (
-                  <View
-                    key={item.id}
-                    style={[styles.savedItem, { backgroundColor: theme.bg, borderColor: theme.border }]}
-                  >
-                    <View style={styles.rowBetween}>
-                      <View style={{ flex: 1, paddingRight: 8 }}>
-                        <Text style={[styles.savedTitle, { color: theme.text }]}>{item.title}</Text>
-                        <Text
-                          style={[
-                            styles.mutedText,
-                            { color: theme.muted, marginTop: 2, marginBottom: 6 },
-                          ]}
-                        >
-                          {item.created_at}
-                        </Text>
-                      </View>
-                      <TouchableOpacity
-                        style={{ paddingHorizontal: 8, paddingVertical: 4 }}
-                        onPress={() => deleteSavedNote(item.id)}
+                savedNotes.map((item) => {
+                  const dateLabel =
+                    typeof item.created_at === 'number'
+                      ? new Date(item.created_at * 1000).toLocaleString()
+                      : item.created_at || '';
+                  return (
+                    <View
+                      key={item.id}
+                      style={[styles.savedItem, { backgroundColor: theme.bg, borderColor: theme.border }]}
+                    >
+                      <Text style={[styles.savedTitle, { color: theme.text }]}>{item.title}</Text>
+                      <Text
+                        style={[
+                          styles.mutedText,
+                          { color: theme.muted, marginTop: 2, marginBottom: 6 },
+                        ]}
                       >
-                        <Text numberOfLines={1} style={styles.removeText}>
-                          Delete
-                        </Text>
-                      </TouchableOpacity>
+                        {dateLabel}
+                      </Text>
+                      <Text style={[styles.noteLine, { color: theme.text }]}>
+                        {item.summary || item.transcript || item.content}
+                      </Text>
                     </View>
-                    <Text style={[styles.noteLine, { color: theme.text }]}>{item.content}</Text>
-                  </View>
-                ))
+                  );
+                })
               )}
             </View>
           )}
